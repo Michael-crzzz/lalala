@@ -13,7 +13,7 @@
 // --- Firebase ---
 #define FIREBASE_HOST "https://gas-sensor-befe7-default-rtdb.firebaseio.com/"
 #define FIREBASE_PATH "/gas_sensor/latest_reading"
-#define FIREBASE_AUTH ""
+#define FIREBASE_AUTH "o7dlAGo8VCykBrxapemvpg4yKjJr2qzkpHrl6VGZ"
 
 // --- Pins ---
 #define MQ2_PIN        34
@@ -37,7 +37,7 @@ void waitForResponse();
 
 void setup() {
   Serial.begin(115200);
-  sim900.begin(9600, SERIAL_8N1, 16, 17);  // GSM RX/TX
+  sim900.begin(9600, SERIAL_8N1, 16, 17);
 
   pinMode(MQ2_PIN, INPUT);
   pinMode(RED_LED, OUTPUT);
@@ -46,8 +46,19 @@ void setup() {
   pinMode(BUZZER2_PIN, OUTPUT);
 
   initTFT();
-  initWiFi();
+  initWiFi();      // <--- Make sure WiFi is connected first!
   initGSM();
+
+  // Now do NTP sync
+  configTime(28800, 0, "time.google.com");
+  Serial.print("Waiting for NTP time sync");
+  time_t now = time(nullptr);
+  while (now < 8 * 3600 * 2) {
+    delay(500);
+    Serial.print(".");
+    now = time(nullptr);
+  }
+  Serial.println("\nTime synchronized!");
 
   displayText("Gas Sensor System", 10, ILI9341_WHITE, 2, true);
   displayText("Initializing...", 50, ILI9341_YELLOW, 2, true);
@@ -60,6 +71,8 @@ void loop() {
   Serial.println(gasValue);
 
   sendToFirebase(gasValue);
+  updateDailyGasStats(gasValue); // <-- Update daily stats for graph
+  sendToSensorData(gasValue);
   updateTFT(gasValue);
 
   if (gasValue >= 1000 && gasNormal) {
@@ -99,7 +112,6 @@ void waitForResponse() {
     }
   }
 }
-
 
 void initGSM() {
   Serial.println("Initializing GSM...");
@@ -149,6 +161,75 @@ void sendToFirebase(int gasValue) {
   }
 }
 
+// --- Update gas_stats/daily for graph ---
+void updateDailyGasStats(int gasValue) {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    // 1. Read current daily array
+    HTTPClient httpsGet;
+    String getUrl = String(FIREBASE_HOST) + "/gas_stats/daily.json";
+    if (strlen(FIREBASE_AUTH) > 0) {
+      getUrl += "?auth=" + String(FIREBASE_AUTH);
+    }
+    String dailyArray = "[]";
+    if (httpsGet.begin(client, getUrl)) {
+      int httpCode = httpsGet.GET();
+      if (httpCode == HTTP_CODE_OK) {
+        dailyArray = httpsGet.getString();
+      }
+      httpsGet.end();
+    }
+
+    // 2. Parse and update the array
+    int daily[7] = {0,0,0,0,0,0,0};
+    int idx = 0;
+    int last = 0;
+    dailyArray.replace("[", "");
+    dailyArray.replace("]", "");
+    for (int i = 0; i < 7; i++) {
+      idx = dailyArray.indexOf(",", last);
+      String val = (idx == -1) ? dailyArray.substring(last) : dailyArray.substring(last, idx);
+      daily[i] = val.toInt();
+      if (idx == -1) break;
+      last = idx + 1;
+    }
+
+    // 3. Get weekday (0=Sunday, 1=Monday, ..., 6=Saturday)
+    time_t now = time(nullptr);
+    struct tm* timeinfo = localtime(&now);
+    int weekday = timeinfo->tm_wday; // 0=Sunday
+
+    // If you want 0=Monday, 6=Sunday (like Flutter), shift index:
+    int index = (weekday == 0) ? 6 : weekday - 1;
+
+    daily[index] = gasValue;
+
+    // 4. Build new JSON array
+    String newArray = "[";
+    for (int i = 0; i < 7; i++) {
+      newArray += String(daily[i]);
+      if (i < 6) newArray += ",";
+    }
+    newArray += "]";
+
+    // 5. Write back to Firebase
+    HTTPClient httpsPut;
+    String putUrl = String(FIREBASE_HOST) + "/gas_stats/daily.json";
+    if (strlen(FIREBASE_AUTH) > 0) {
+      putUrl += "?auth=" + String(FIREBASE_AUTH);
+    }
+    if (httpsPut.begin(client, putUrl)) {
+      httpsPut.addHeader("Content-Type", "application/json");
+      int code = httpsPut.PUT(newArray);
+      Serial.print("Updated gas_stats/daily. Code: ");
+      Serial.println(code);
+      httpsPut.end();
+    }
+  }
+}
+
 void updateTFT(int value) {
   tft.fillRect(0, 0, 320, 100, ILI9341_BLACK); // Clear display area
   displayText("Gas Value", 10, ILI9341_WHITE, 2, false);
@@ -190,4 +271,46 @@ void displayText(String text, int y, uint16_t color, int size, bool clearLine) {
 
   tft.setCursor(x, y);
   tft.print(text);
+}
+
+void sendToSensorData(int gasValue) {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    time_t now = time(nullptr);
+    struct tm* timeinfo = localtime(&now);
+
+    char dateStr[11];   // "YYYY-MM-DD"
+    strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", timeinfo);
+
+    char timeStr[9];    // "HH:MM:SS"
+    strftime(timeStr, sizeof(timeStr), "%H:%M:%S", timeinfo);
+
+    String url = String(FIREBASE_HOST) + "/sensor_data/" + dateStr + ".json";
+    if (strlen(FIREBASE_AUTH) > 0) {
+      url += "?auth=" + String(FIREBASE_AUTH);
+    }
+
+    HTTPClient https;
+    if (https.begin(client, url)) {
+      https.addHeader("Content-Type", "application/json");
+
+      String payload = "{";
+      payload += "\"timestamp\":\"" + String(timeStr) + "\",";
+      payload += "\"value\":" + String(gasValue);
+      payload += "}";
+
+      int code = https.POST(payload);
+      if (code > 0) {
+        Serial.print("sensor_data updated. Code: ");
+        Serial.println(code);
+      } else {
+        Serial.print("sensor_data error: ");
+        Serial.println(https.errorToString(code));
+      }
+
+      https.end();
+    }
+  }
 }
