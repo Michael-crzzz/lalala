@@ -8,16 +8,13 @@
 #include <time.h>
 
 // --- WiFi ---
-#define WIFI_SSID     "MJM4G"
-#define WIFI_PASSWORD "Al3x@ndr@2020"
+#define WIFI_SSID     "ame"
+#define WIFI_PASSWORD "123123123"
 
 // --- Firebase ---
 #define FIREBASE_HOST "https://gas-sensor-befe7-default-rtdb.firebaseio.com/"
 #define FIREBASE_PATH "/gas_sensor/latest_reading"
 #define FIREBASE_AUTH "o7dlAGo8VCykBrxapemvpg4yKjJr2qzkpHrl6VGZ"
-
-unsigned long lastGasReadTime = 0;
-const unsigned long gasReadInterval = 3000;
 
 // --- Pins ---
 #define MQ2_PIN        34
@@ -25,7 +22,6 @@ const unsigned long gasReadInterval = 3000;
 #define GREEN_LED      26
 #define BUZZER1_PIN    13
 #define BUZZER2_PIN    14
-#define BUTTON_PIN     27
 
 // --- TFT Config ---
 #define TFT_CS   5
@@ -37,7 +33,6 @@ Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
 HardwareSerial sim900(2);  // RX=16, TX=17
 
 bool gasNormal = true;
-bool buzzerSilenced = false;
 
 void setup() {
   Serial.begin(115200);
@@ -48,8 +43,6 @@ void setup() {
   pinMode(GREEN_LED, OUTPUT);
   pinMode(BUZZER1_PIN, OUTPUT);
   pinMode(BUZZER2_PIN, OUTPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP); // Button normally HIGH, goes LOW when pressed
-
 
   initTFT();
   initWiFi();
@@ -72,45 +65,34 @@ void setup() {
 }
 
 void loop() {
-  // Non-blocking gas reading
-  if (millis() - lastGasReadTime >= gasReadInterval) {
-    lastGasReadTime = millis();
+  int gasValue = analogRead(MQ2_PIN);
+  Serial.print("Gas Value: ");
+  Serial.println(gasValue);
 
-    int gasValue = analogRead(MQ2_PIN);
-    Serial.print("Gas Value: ");
-    Serial.println(gasValue);
+  // Send to both Firebase paths
+  sendToFirebase(gasValue);
+  sendToSensorData(gasValue);
+  
+  // Update daily stats for graph
+  updateDailyGasStats(gasValue);
+  updateTFT(gasValue);
 
-    sendToFirebase(gasValue);
-    sendToSensorData(gasValue);
-    updateDailyGasStats(gasValue);
-    updateTFT(gasValue);
-
-    if (gasValue >= 500 && gasNormal) {
-      digitalWrite(RED_LED, HIGH);
-      digitalWrite(GREEN_LED, LOW);
-      if (!buzzerSilenced) {
-        digitalWrite(BUZZER1_PIN, HIGH);
-        digitalWrite(BUZZER2_PIN, HIGH);
-      }
-      triggerAlert("ALERT! HIGH GAS LEVEL", 3);
-      sendSMS("+639617586513", "ALERT: Dangerous gas levels detected.");
-      gasNormal = false;
-    } else if (gasValue < 500 && !gasNormal) {
-      resetAlert("Gas Level Normal", 2);
-      gasNormal = true;
-      buzzerSilenced = false;
-    }
+  // Handle alerts
+  if (gasValue >= 500 && gasNormal) {
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(GREEN_LED, LOW);
+    triggerAlert("ALERT! HIGH GAS LEVEL", 3);
+    sendSMS("+639617586513", "ALERT: Dangerous gas levels detected.");
+    gasNormal = false;
+  } else if (gasValue < 500 && !gasNormal) {
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(GREEN_LED, HIGH);
+    resetAlert("Gas Level Normal", 2);
+    gasNormal = true;
   }
+  
 
-  // Button check (instant, not delayed)
-  if (digitalRead(BUTTON_PIN) == LOW) {
-    digitalWrite(BUZZER1_PIN, LOW);
-    digitalWrite(BUZZER2_PIN, LOW);
-    buzzerSilenced = true;
-    sendAlertAcknowledgementToFirebase();
-    Serial.println("Button pressed: buzzer silenced");
-    delay(300); // debounce
-  }
+  delay(3000);
 }
 
 void sendToFirebase(int gasValue) {
